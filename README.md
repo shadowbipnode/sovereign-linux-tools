@@ -43,7 +43,6 @@ These are living documents — they improve with real-world feedback.
 
 ---
 
-## Author
 
 **shadowbip** — sovereign Bitcoin node operator, cypherpunk.  
 Nostr: `npub1yag9ggwzdrekxput74qq66p88wv8r68r2f3lm3znycqqyh408ufs7htp3e`  
