@@ -11,6 +11,7 @@ No theory. No marketing. Just working configurations and commands tested on real
 | Guide | Description |
 |-------|-------------|
 | [gocryptfs](./guides/gocryptfs.md) | File-level encryption on Linux — lock sensitive data even while the system is running |
+| [signal-opsec](./guides/signal-opsec.md) | Signal notification settings, metadata leaks, iOS vs GrapheneOS |
 
 *More guides coming.*
 
