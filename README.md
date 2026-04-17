@@ -12,6 +12,9 @@ No theory. No marketing. Just working configurations and commands tested on real
 |-------|-------------|
 | [gocryptfs](./guides/gocryptfs.md) | File-level encryption on Linux — lock sensitive data even while the system is running |
 | [signal-opsec](./guides/signal-opsec.md) | Signal notification settings, metadata leaks, iOS vs GrapheneOS |
+| [lnd-backup](./guides/lnd-backup.md) | Automated LND backup with GPG encryption and cloud redundancy |
+| [sovereign-backup](./guides/sovereign-backup.md) | Triple-redundant encrypted backup for Bitcoin/Lightning nodes |
+| [ssh-hardening](./guides/ssh-hardening.md) | Complete SSH hardening for production Linux servers |
 
 *More guides coming.*
 
