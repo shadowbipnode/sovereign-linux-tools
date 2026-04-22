@@ -15,7 +15,8 @@ No theory. No marketing. Just working configurations and commands tested on real
 | [lnd-backup](./guides/lnd-backup.md) | Automated LND backup with GPG encryption and cloud redundancy |
 | [sovereign-backup](./guides/sovereign-backup.md) | Triple-redundant encrypted backup for Bitcoin/Lightning nodes |
 | [ssh-hardening](./guides/ssh-hardening.md) | Complete SSH hardening for production Linux servers |
-| [tor-setup](./guides/tor-setup.md) | Complete SSH hardening for production Linux servers |
+| [tor-setup](./guides/tor-setup.md) | Complete guide Tor Setup — Running Bitcoin Core and LND over Tor |
+| [tor-transparent-proxy-guide](./guides/tor-transparent-proxy-guide.md) | Complete guide to routing ALL System Traffic Through Tor on Rocky Linux 9 |
 
 *More guides coming.*
 
