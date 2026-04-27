@@ -31,6 +31,8 @@ A complete guide to configuring a transparent Tor proxy on Rocky Linux 9, forcin
 
 This guide configures your Rocky Linux 9 system to route **all** outgoing TCP traffic and DNS queries through Tor using a transparent proxy. A kill switch ensures that if Tor goes down, no traffic leaks out in the clear.
 
+The scripts automatically detect your network gateway, so the setup works on any network — home, office, hotspot, or public WiFi.
+
 ## What This Setup Does
 
 | Layer | Protection |
@@ -43,6 +45,8 @@ This guide configures your Rocky Linux 9 system to route **all** outgoing TCP tr
 | mDNS/Avahi | Disabled and masked |
 | Boot persistence | systemd service restores rules on reboot |
 | Exit node filtering | Excludes nodes in high-surveillance countries |
+| Bootstrap safety | Kill switch only activates after Tor is fully connected |
+| Network portability | Scripts auto-detect gateway — works on any network |
 
 ---
 
@@ -70,15 +74,19 @@ ps -eo user,pid,comm | grep tor
 
 ## Step 1 — Disable IPv6
 
-IPv6 is a major leak vector. Tor does not handle IPv6 traffic, so any IPv6-capable application can bypass the proxy entirely.
+IPv6 is a major leak vector. Tor does not handle IPv6 traffic, so any IPv6-capable application can bypass the proxy entirely. This is the single most common source of IP leaks — even with iptables rules active, IPv6 traffic flows through a completely separate stack (ip6tables) that must be blocked independently.
+
+Disable immediately:
 
 ```bash
-# Disable immediately
 sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1
 sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1
 sudo sysctl -w net.ipv6.conf.lo.disable_ipv6=1
+```
 
-# Disable on specific interfaces (adjust names to your system)
+Disable on your specific interfaces (adjust names to match your system — find them with `ip link show`):
+
+```bash
 sudo sysctl -w net.ipv6.conf.wlo1.disable_ipv6=1
 sudo sysctl -w net.ipv6.conf.enp0s20f0u1.disable_ipv6=1
 ```
@@ -110,7 +118,7 @@ ip -6 addr show scope global
 # Should return nothing
 ```
 
-> **Note:** Replace `wlo1` and `enp0s20f0u1` with your actual interface names. Find them with `ip link show`.
+> **Important:** The `sysctl` setting `net.ipv6.conf.all.disable_ipv6 = 1` is not always enough. NetworkManager can re-enable IPv6 per-connection, and some interfaces may not respect the `all` flag. Always disable IPv6 on each specific interface AND in NetworkManager for reliable protection.
 
 ---
 
@@ -137,31 +145,32 @@ StrictNodes 1
 EOF
 ```
 
-> **Why port 5399 instead of 5353?** Port 5353 is used by Avahi (mDNS) and Chromium-based browsers. Using 5399 avoids conflicts.
+> **Why port 5399 instead of 5353?** Port 5353 is used by Avahi (mDNS) and Chromium-based browsers (including Brave). Using 5399 avoids conflicts that prevent Tor from starting.
 
 ---
 
 ## Step 3 — Fix SELinux Policies
 
-Rocky Linux 9 runs SELinux in Enforcing mode. Tor needs permission to bind to the new ports.
+Rocky Linux 9 runs SELinux in Enforcing mode by default. Tor needs permission to bind to the new ports (9040 and 5399). Without this step, Tor will fail to start with "Permission denied" errors.
+
+Add the ports to SELinux policy:
 
 ```bash
-# Add ports to SELinux policy
 sudo semanage port -a -t tor_port_t -p tcp 9040
 sudo semanage port -a -t tor_port_t -p tcp 5399
 sudo semanage port -a -t tor_port_t -p udp 5399
 ```
 
-If `semanage port -a` fails with "already defined", use `-m` instead:
+If `semanage port -a` fails with "already defined", use `-m` (modify) instead:
 
 ```bash
 sudo semanage port -m -t tor_port_t -p tcp 5399
 ```
 
-If Tor still fails to start, generate a custom SELinux module:
+If Tor still fails to start after adding ports, generate a custom SELinux module from the denial logs:
 
 ```bash
-# Temporarily set permissive to capture denials
+# Temporarily set permissive to capture all denials
 sudo setenforce 0
 sudo systemctl restart tor
 
@@ -174,7 +183,7 @@ sudo setenforce 1
 sudo systemctl restart tor
 ```
 
-Verify Tor is running:
+Verify Tor is running with all three ports:
 
 ```bash
 sudo systemctl status tor
@@ -185,8 +194,8 @@ ss -ulnp | grep 5399
 Expected output — three listeners:
 
 ```
-LISTEN  127.0.0.1:9040   (TransPort)
-LISTEN  127.0.0.1:9050   (SocksPort)
+LISTEN  127.0.0.1:9040   (TransPort - TCP)
+LISTEN  127.0.0.1:9050   (SocksPort - TCP)
 UNCONN  127.0.0.1:5399   (DNSPort - UDP)
 ```
 
@@ -194,7 +203,7 @@ UNCONN  127.0.0.1:5399   (DNSPort - UDP)
 
 ## Step 4 — Disable Avahi (mDNS)
 
-Avahi broadcasts your hostname and services on the local network — a privacy leak.
+Avahi broadcasts your hostname and available services on the local network. This is a privacy leak and also conflicts with DNS port usage.
 
 ```bash
 sudo systemctl stop avahi-daemon
@@ -206,6 +215,13 @@ sudo systemctl mask avahi-daemon
 
 ## Step 5 — Create the Transparent Proxy Script
 
+This script activates the transparent proxy. Key features:
+
+- **Bootstrap verification:** Checks that Tor has fully connected before enabling the kill switch. If Tor can't connect, it exits without blocking your traffic.
+- **IPv6 blocking:** Drops all IPv6 traffic via ip6tables as a second line of defense.
+- **DNS locking:** Sets `resolv.conf` to `127.0.0.1` and makes it immutable.
+- **DNS redirect ordering:** Redirects DNS to `127.0.0.1:53` *before* the loopback exclusion rule — this is critical (see [Design Decisions](#design-decisions) below).
+
 ```bash
 sudo tee /usr/local/bin/tor-transparent.sh << 'SCRIPT'
 #!/bin/bash
@@ -213,6 +229,23 @@ TOR_USER="toranon"
 TOR_TRANS_PORT="9040"
 TOR_DNS_PORT="5399"
 NON_TOR="127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
+
+# Verify Tor is running
+if ! systemctl is-active tor &>/dev/null; then
+    echo "[!] Tor is not running. Starting..."
+    systemctl start tor
+    sleep 5
+fi
+
+# Verify bootstrap completed
+if ! journalctl -u tor --no-pager -n 20 | grep -q "Bootstrapped 100%"; then
+    echo "[!] Tor has not finished bootstrapping. Waiting 15s..."
+    sleep 15
+    if ! journalctl -u tor --no-pager -n 20 | grep -q "Bootstrapped 100%"; then
+        echo "[ERROR] Tor cannot connect. Exiting without activating kill switch."
+        exit 1
+    fi
+fi
 
 ### CLEANUP ###
 iptables -F
@@ -238,7 +271,6 @@ chattr +i /etc/resolv.conf
 iptables -t nat -A OUTPUT -m owner --uid-owner $TOR_USER -j RETURN
 
 # Redirect DNS to 127.0.0.1 BEFORE the loopback exclusion
-# (resolv.conf points to 127.0.0.1, so DNS goes to loopback)
 iptables -t nat -A OUTPUT -d 127.0.0.1 -p udp --dport 53 -j REDIRECT --to-ports $TOR_DNS_PORT
 iptables -t nat -A OUTPUT -d 127.0.0.1 -p tcp --dport 53 -j REDIRECT --to-ports $TOR_DNS_PORT
 
@@ -266,15 +298,19 @@ SCRIPT
 sudo chmod +x /usr/local/bin/tor-transparent.sh
 ```
 
-### Key Design Decisions
+### Design Decisions
 
-**DNS redirect before loopback exclusion:** When `resolv.conf` points to `127.0.0.1`, applications send DNS queries to `127.0.0.1:53`. Without the early redirect rule, the loopback exclusion (`RETURN` for `127.0.0.0/8`) would skip the DNS redirect entirely, and queries would fail because nothing listens on `127.0.0.1:53`. By placing the DNS redirect rule before the loopback exclusion, DNS queries to `127.0.0.1:53` are properly redirected to Tor's DNSPort on `127.0.0.1:5399`.
+**DNS redirect before loopback exclusion:** When `resolv.conf` points to `127.0.0.1`, applications send DNS queries to `127.0.0.1:53`. Without the early redirect rule, the loopback exclusion (`RETURN` for `127.0.0.0/8`) would skip the DNS redirect entirely, and queries would fail because nothing listens on `127.0.0.1:53`. By placing the DNS redirect rule *before* the loopback exclusion, DNS queries to `127.0.0.1:53` are properly redirected to Tor's DNSPort on `127.0.0.1:5399`.
+
+**Bootstrap verification:** The script checks that Tor has completed its bootstrap (connected to the Tor network) before activating the kill switch. Without this check, activating the kill switch on a network where Tor can't connect would leave you with no internet and no way to recover remotely.
 
 **Kill switch:** The final `DROP` rule ensures that if Tor crashes, all traffic is blocked rather than leaking in the clear.
 
 ---
 
 ## Step 6 — Create the Disable Script
+
+This script deactivates the transparent proxy and automatically detects your current network gateway to restore DNS — so it works on any network, not just your home LAN.
 
 ```bash
 sudo tee /usr/local/bin/tor-transparent-off.sh << 'SCRIPT'
@@ -285,16 +321,26 @@ iptables -t nat -F
 iptables -X
 iptables -t nat -X
 iptables -P OUTPUT ACCEPT
-# Unlock and restore DNS
-chattr -i /etc/resolv.conf
-echo -e "nameserver 192.168.0.1\nsearch Home" > /etc/resolv.conf
-echo "[OK] Tor Transparent Proxy DISABLED — normal traffic restored"
+# Restore IPv6
+ip6tables -F
+ip6tables -P OUTPUT ACCEPT
+ip6tables -P INPUT ACCEPT
+ip6tables -P FORWARD ACCEPT
+# Unlock and restore DNS automatically
+chattr -i /etc/resolv.conf 2>/dev/null
+# Auto-detect current gateway
+GW=$(ip route | grep "default" | head -1 | awk '{print $3}')
+if [ -n "$GW" ]; then
+    echo -e "nameserver $GW\nsearch Home" > /etc/resolv.conf
+else
+    echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8\nsearch Home" > /etc/resolv.conf
+fi
+echo "[OK] Tor Transparent Proxy DISABLED"
+echo "DNS: $(grep nameserver /etc/resolv.conf)"
 SCRIPT
 
 sudo chmod +x /usr/local/bin/tor-transparent-off.sh
 ```
-
-> **Note:** Replace `192.168.0.1` with your router's IP address.
 
 ---
 
@@ -306,19 +352,29 @@ If everything breaks and you have no network, use this from a local TTY (`Ctrl+A
 sudo tee /usr/local/bin/net-emergency.sh << 'SCRIPT'
 #!/bin/bash
 echo "[!] EMERGENCY NETWORK RECOVERY"
-chattr -i /etc/resolv.conf
-echo -e "nameserver 192.168.0.1\nsearch Home" > /etc/resolv.conf
+# Unlock resolv.conf
+chattr -i /etc/resolv.conf 2>/dev/null
+# Clean iptables
 iptables -F
 iptables -t nat -F
 iptables -X
 iptables -t nat -X
 iptables -P OUTPUT ACCEPT
+# Restore IPv6
 ip6tables -F
 ip6tables -P OUTPUT ACCEPT
 ip6tables -P INPUT ACCEPT
 ip6tables -P FORWARD ACCEPT
-echo "[OK] Network restored to default state"
-echo "DNS: $(cat /etc/resolv.conf | grep nameserver)"
+# Auto-detect gateway
+GW=$(ip route | grep "default" | head -1 | awk '{print $3}')
+if [ -n "$GW" ]; then
+    echo -e "nameserver $GW\nsearch Home" > /etc/resolv.conf
+else
+    echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8\nsearch Home" > /etc/resolv.conf
+fi
+echo "[OK] Network restored"
+echo "DNS: $(grep nameserver /etc/resolv.conf)"
+echo "GW:  $GW"
 SCRIPT
 
 sudo chmod +x /usr/local/bin/net-emergency.sh
@@ -339,7 +395,7 @@ EOF
 sudo systemctl restart NetworkManager
 ```
 
-The `tor-transparent.sh` script handles locking `resolv.conf` with `chattr +i` automatically.
+The `tor-transparent.sh` script handles locking `resolv.conf` with `chattr +i` automatically when activated.
 
 ---
 
@@ -383,13 +439,15 @@ Add convenience aliases to your `~/.bashrc`:
 ```bash
 cat >> ~/.bashrc << 'EOF'
 
-# === Tor Transparent Proxy ===
+# === Tor / VPN / Network ===
 alias toron='sudo /usr/local/bin/tor-transparent.sh'
 alias toroff='sudo /usr/local/bin/tor-transparent-off.sh'
 alias torstatus='echo "=== IP ===" && curl -s --max-time 15 https://check.torproject.org/api/ip && echo "" && echo "=== Rules ===" && sudo iptables -L OUTPUT -n --line-numbers && echo "=== Tor ===" && systemctl is-active tor'
-alias dnstor='sudo chattr -i /etc/resolv.conf && sudo bash -c "echo -e \"nameserver 127.0.0.1\nsearch Home\" > /etc/resolv.conf" && sudo chattr +i /etc/resolv.conf && echo "DNS via Tor (locked)"'
-alias dnsreset='sudo chattr -i /etc/resolv.conf && sudo bash -c "echo -e \"nameserver 192.168.0.1\nsearch Home\" > /etc/resolv.conf" && echo "DNS restored to router"'
+alias dnstor='sudo chattr -i /etc/resolv.conf 2>/dev/null; sudo bash -c "echo -e \"nameserver 127.0.0.1\nsearch Home\" > /etc/resolv.conf"; sudo chattr +i /etc/resolv.conf; echo "DNS via Tor (locked)"'
+alias dnsreset='sudo chattr -i /etc/resolv.conf 2>/dev/null; GW=$(ip route | grep default | head -1 | awk "{print \$3}"); sudo bash -c "echo -e \"nameserver ${GW:-1.1.1.1}\nsearch Home\" > /etc/resolv.conf"; echo "DNS reset to ${GW:-1.1.1.1}"'
 alias netfix='sudo /usr/local/bin/net-emergency.sh'
+alias vpnon='sudo /usr/local/bin/tor-transparent-off.sh && sudo systemctl restart mullvad-daemon && sleep 2 && mullvad connect && sleep 5 && mullvad status'
+alias vpnoff='mullvad disconnect && sleep 2'
 EOF
 
 source ~/.bashrc
@@ -398,30 +456,19 @@ source ~/.bashrc
 | Alias | Function |
 |-------|----------|
 | `toron` | Activate transparent proxy + kill switch |
-| `toroff` | Deactivate proxy, restore normal traffic |
-| `torstatus` | Check current IP, rules, and Tor status |
-| `dnstor` | Force DNS through Tor |
-| `dnsreset` | Restore DNS to local router |
+| `toroff` | Deactivate proxy, auto-detect gateway, restore DNS |
+| `torstatus` | Check current IP, iptables rules, and Tor status |
+| `dnstor` | Force DNS through Tor and lock resolv.conf |
+| `dnsreset` | Auto-detect gateway and restore DNS |
 | `netfix` | Emergency — restore everything to defaults |
+| `vpnon` | Disable Tor + start Mullvad VPN |
+| `vpnoff` | Disconnect Mullvad VPN |
 
 ---
 
 ## Step 11 — Mullvad VPN Integration (Optional)
 
 If you have Mullvad VPN, you can switch between Tor and Mullvad. They should **never run simultaneously** — they conflict on routing and DNS.
-
-Add these aliases:
-
-```bash
-cat >> ~/.bashrc << 'EOF'
-
-# === Tor <-> Mullvad Switch ===
-alias vpnon='sudo /usr/local/bin/tor-transparent-off.sh && sudo systemctl restart mullvad-daemon && sleep 2 && mullvad connect && sleep 5 && mullvad status'
-alias vpnoff='mullvad disconnect && sleep 2'
-EOF
-
-source ~/.bashrc
-```
 
 **Workflow:**
 
@@ -431,6 +478,8 @@ source ~/.bashrc
 | Mullvad | Tor | `vpnoff && toron` |
 | Tor | Normal | `toroff` |
 | Normal | Tor | `toron` |
+
+> **Note:** Mullvad uses nftables for its firewall rules. If Mullvad shows "Unable to apply firewall rules", restart the daemon after disabling Tor: `toroff && sudo systemctl restart mullvad-daemon && mullvad connect`
 
 ---
 
@@ -490,6 +539,15 @@ sudo semodule -i tor_fix.pp
 sudo systemctl restart tor
 ```
 
+### Tor won't start — port 5353 already in use
+
+Avahi or a Chromium-based browser is using port 5353. That's why this guide uses port 5399 instead. If you still have issues:
+
+```bash
+ss -ulnp | grep 5353
+sudo systemctl mask avahi-daemon
+```
+
 ### DNS resolution fails
 
 Check if the DNS redirect is working:
@@ -498,9 +556,11 @@ Check if the DNS redirect is working:
 # Direct test to Tor DNS
 dig +short google.com @127.0.0.1 -p 5399
 
-# If this works but normal dig fails, the iptables redirect isn't catching it
-sudo iptables -t nat -L OUTPUT -n | grep 5399
+# If this works but normal dig fails, check the iptables redirect order
+sudo iptables -t nat -L OUTPUT -n --line-numbers
 ```
+
+The DNS redirect to `127.0.0.1` must appear **before** the loopback RETURN rule. If the order is wrong, DNS queries to `127.0.0.1:53` will be skipped by the loopback exclusion and never reach Tor's DNSPort.
 
 ### IPv6 leak after reboot
 
@@ -512,6 +572,25 @@ for conn in $(nmcli -t -f NAME c show --active); do
 done
 sudo nmcli general reload
 ```
+
+### toron fails on a different network
+
+If Tor can't bootstrap (e.g., the network blocks Tor relay ports), the script will exit without activating the kill switch. You'll see:
+
+```
+[ERROR] Tor cannot connect. Exiting without activating kill switch.
+```
+
+In this case, consider using Tor bridges:
+
+```bash
+# Add to /etc/tor/torrc.d/transparent.conf
+UseBridges 1
+ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy
+Bridge obfs4 <bridge-address>
+```
+
+Get bridges from [https://bridges.torproject.org](https://bridges.torproject.org).
 
 ### Lost all connectivity
 
@@ -538,14 +617,14 @@ mullvad connect
 
 | File | Purpose |
 |------|---------|
-| `/etc/tor/torrc.d/transparent.conf` | Tor transparent proxy config |
+| `/etc/tor/torrc.d/transparent.conf` | Tor transparent proxy configuration |
 | `/etc/sysctl.d/99-disable-ipv6.conf` | Permanently disable IPv6 |
 | `/etc/NetworkManager/conf.d/no-dns.conf` | Prevent NM from overwriting DNS |
-| `/usr/local/bin/tor-transparent.sh` | Activation script |
-| `/usr/local/bin/tor-transparent-off.sh` | Deactivation script |
-| `/usr/local/bin/net-emergency.sh` | Emergency recovery script |
-| `/etc/systemd/system/tor-transparent.service` | Boot persistence |
-| `/etc/resolv.conf` | Locked to `127.0.0.1` |
+| `/usr/local/bin/tor-transparent.sh` | Activation script (with bootstrap check) |
+| `/usr/local/bin/tor-transparent-off.sh` | Deactivation script (with auto-gateway detection) |
+| `/usr/local/bin/net-emergency.sh` | Emergency recovery script (with auto-gateway detection) |
+| `/etc/systemd/system/tor-transparent.service` | Boot persistence via systemd |
+| `/etc/resolv.conf` | Locked to `127.0.0.1` when Tor is active |
 
 ---
 
@@ -554,12 +633,13 @@ mullvad connect
 - **UDP traffic is blocked.** Tor only supports TCP. Applications relying on UDP (VoIP, gaming, some video streaming) will not work.
 - **Tor is not a silver bullet.** Browser fingerprinting, WebRTC leaks, and application-level leaks can still compromise anonymity. Harden your browser (disable WebRTC, remote HTML loading, telemetry).
 - **Exit node trust.** Tor exit nodes can see unencrypted traffic. Always use HTTPS.
-- **Local network services** (ports on `0.0.0.0`) are accessible from your LAN. Consider binding them to `127.0.0.1` if not needed externally.
-- **ZeroTier / VPN tunnels** bypass Tor by design. Be aware of what traffic goes through these tunnels.
+- **Local network services** listening on `0.0.0.0` are accessible from your LAN. Consider binding them to `127.0.0.1` if not needed externally.
+- **ZeroTier / VPN tunnels** bypass Tor by design (their traffic stays within the local network ranges excluded by the iptables rules). Be aware of what traffic goes through these tunnels.
 - **This setup does not anonymize traffic from other devices** on your network — only the local machine.
+- **The bootstrap check is not bulletproof.** If Tor bootstraps successfully but later loses connectivity, the kill switch will block all traffic (which is the intended behavior — fail closed, not fail open).
 
 ---
 
-*Part of [sovereign-linux-tools](https://github.com/shadowbipnode/sovereign-linux-tools) — practical guides for digital sovereignty.*
+## License
 
-
+This guide is released under [MIT License](LICENSE). Use at your own risk.
